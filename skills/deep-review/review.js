@@ -95,9 +95,11 @@ The finding names a file and a line; that is where the claim points, not where
 the answer is. Read the callers.
 
 Some claims cannot be settled by running something - anything depending on what a
-human sees rendered, on real hardware timing, or on an environment you lack. Say
-so and answer real=false with the reason. A confident wrong verdict ends the
-investigation.
+human sees rendered, on real hardware timing, on an environment you lack, or on
+mutating something you are not allowed to touch. Say so and answer real=false
+with the reason. A confident wrong verdict ends the investigation, but so does a
+probe that destroys the thing it was measuring: taking that exit is the correct
+move, not a failure.
 
 "Seems plausible" is not a verdict. "proof" must name evidence you actually
 looked at: the command you ran and its output, or the path:line that settles it.
@@ -127,6 +129,17 @@ defect this review shape ever found was invisible to five careful reading passes
 AND to a purpose-built benchmark, because the benchmark built a project with no
 mesh loaded and the bug was that the mesh was being copied. Before any claim
 about cost or behaviour, build the state the feature actually meets.
+
+BUILD THAT STATE SOMEWHERE DISPOSABLE. The rule above tells you to construct a
+realistic fixture; it does NOT license you to construct it on top of somebody's
+work. You are running on a real machine that a real person is using, and most of
+what is expensive there cannot be recovered: uncommitted changes in the working
+tree, an open application session holding unsaved state, a database or service
+something else depends on, a running container, a populated cache. Work in a
+scratch directory or on a copy you made. Never reset, clean, check out over,
+stash, truncate, drop, restart, uninstall or overwrite anything you did not
+create yourself. If the only way to settle a claim is to mutate one of those,
+DO NOT - leave it alone and report the claim as one you could not prove.
 
 Cite file:line for everything. Never edit a file.
 `
@@ -278,13 +291,67 @@ const swept = await parallel(DIMENSIONS.map((d) => () =>
     schema: FINDING,
   }).then((r) => ({ key: d.key, result: r }))))
 
+// A finding can satisfy the schema and still carry nothing - every field the
+// right type, every value filler. Observed: a whole dimension came back as
+// {"title":"test","file":"a.py","claim":"x","probe":"x"} and flowed into `minor`
+// where it read as a swept dimension with one small issue. The unknown-dimension
+// check below exists because "a run that finds nothing reads exactly like clean
+// code"; this is the same failure with a valid key, so it needs the same loudness.
+//
+// QUARANTINE, NEVER DELETE. A rule that deletes is a rule that deletes real
+// findings in a repo nobody here can test against - "the path must contain a dot
+// or a slash" would silently drop a blocker in Makefile, Dockerfile or LICENSE.
+// So this only ever moves a finding to `suspect`, where the report can still see
+// it, and every rule below asks whether the value is DEGENERATE rather than
+// whether it is short. FINDER_PERSONA explicitly invites a finder that cannot
+// build a concrete trigger to say so on the finding instead of dropping it, so
+// brevity alone must never be disqualifying.
+function degenerate(f) {
+  const text = (s) => String(s == null ? '' : s).trim()
+  const title = text(f.title)
+  const file = text(f.file)
+  if (!title) return 'title is empty'
+  if (!file) return 'file is empty'
+  const body = [text(f.claim), text(f.scenario), text(f.probe)]
+  if (body.some((s) => !s)) return 'claim, scenario or probe is empty'
+  // One bare token with no spaces is a placeholder, not a sentence. Two of the
+  // three is past any plausible terse-but-real finding.
+  const stub = body.filter((s) => s.length <= 3 && s.indexOf(' ') === -1)
+  if (stub.length >= 2) return 'claim/scenario/probe are single-token placeholders'
+  if (body[0] === body[1] && body[1] === body[2]) return 'claim, scenario and probe are identical'
+  return ''
+}
+
 const sweeps = swept.filter(Boolean)
 const found = []
+const suspect = []
 const coverage = []
 for (const s of sweeps) {
-  if (!s.result) { coverage.push({ dimension: s.key, traced: '(agent returned nothing)' }); continue }
-  coverage.push({ dimension: s.key, traced: s.result.traced_clean })
-  for (const f of s.result.findings || []) found.push({ ...f, dimension: s.key })
+  if (!s.result) {
+    coverage.push({ dimension: s.key, traced: '(agent returned nothing)', findings: 0, suspect: 0 })
+    continue
+  }
+  let ok = 0
+  let bad = 0
+  for (const f of s.result.findings || []) {
+    const row = { ...f, dimension: s.key }
+    const why = degenerate(row)
+    if (why) { suspect.push({ ...row, suspect_reason: why }); bad++ } else { found.push(row); ok++ }
+  }
+  // The COUNTS are the point. `traced` is the finder's own word for what it read,
+  // and a finder that produced nothing usable still writes a confident one. Only
+  // a number separates a dimension that swept clean from one that never ran.
+  coverage.push({ dimension: s.key, traced: s.result.traced_clean, findings: ok, suspect: bad })
+}
+
+if (suspect.length) {
+  log(`QUARANTINED ${suspect.length} finding(s) - schema-valid but empty of content: ` +
+    suspect.map((s) => `${s.dimension}/${s.title}`).join(' | '))
+}
+const barren = coverage.filter((c) => !c.findings)
+if (barren.length) {
+  log(`PRODUCED NOTHING USABLE - treat as UNSWEPT, not clean: ` +
+    barren.map((c) => c.dimension).join(', '))
 }
 
 // ---- Phase 2: dedup. Plain code, no agent, no tokens. ---------------------
@@ -302,34 +369,45 @@ for (const s of sweeps) {
 // - measured, at undo_commands.py:114 - so the whole group's claims go to the
 // verifier and it rules on each. Sending only a "lead" silently loses the rest.
 
-// The file half of the key is the last few PATH SEGMENTS, not the bare basename.
+// The file half of the key is the WHOLE normalised path, and paths that differ
+// only by how much root an agent included are joined afterwards.
 //
-// Basename alone was the original choice for a good reason - independent agents
-// report the same file differently ("build/x.py", "./build/x.py", an absolute
-// path), and the bare name is the one form they all agree on. But it
-// over-normalises: any repo where a name repeats across packages - 27 main.py,
-// 29 config.py, 250 __init__.py in the codebase this was fixed against - collapses
-// unrelated files into one cluster. Downstream that hands a verifier claims from
-// several files while telling it they are "all in config.py", and the batching
-// below reads the wrong file.
+// The bare basename was the original choice for a good reason - independent
+// agents report the same file differently ("build/x.py", "./build/x.py", an
+// absolute path), and the bare name is the one form they all agree on. But it
+// over-normalises: any repo that repeats a filename across packages folds
+// unrelated files into one cluster, which then hands a verifier claims from
+// several files while telling it they share one.
 //
-// Keeping the tail segments survives the prefix disagreement that motivated the
-// basename (a suffix is stable however the agent spelled the root) while still
-// separating qc_tool/core/config.py from subdiv_tool/core/config.py.
-const PATH_SEGMENTS = 3
-
+// A fixed number of tail segments is the same mistake with a bigger number -
+// three segments still collapses apps/web/src/components/Button/index.tsx and
+// apps/admin/src/components/Button/index.tsx in any monorepo. So keep the full
+// path and join on the SUFFIX relation instead: that absorbs the prefix
+// disagreement that motivated the basename, at any depth, without ever assuming
+// how deeply the repo nests. The '/' boundary in isSamePath keeps config.py from
+// matching myconfig.py.
 function normPath(p) {
-  const parts = String(p || '?')
+  return String(p || '?')
     .replace(/\\/g, '/')
     .toLowerCase()
     .split('/')
     .filter((s) => s && s !== '.')
-  return parts.slice(-PATH_SEGMENTS).join('/')
+    .join('/')
+}
+
+function isSamePath(a, b) {
+  if (a === b) return true
+  return a.endsWith('/' + b) || b.endsWith('/' + a)
 }
 
 function locKey(f) {
   const line = typeof f.line === 'number' ? Math.floor(f.line / 20) : 'x'
   return normPath(f.file) + '#' + line
+}
+
+function keyParts(k) {
+  const cut = k.lastIndexOf('#')
+  return { path: k.slice(0, cut), line: k.slice(cut + 1) }
 }
 
 const parent = {}
@@ -346,6 +424,20 @@ for (const f of found) {
   const k = locKey(f)
   if (parent[k] === undefined) parent[k] = k
 }
+
+// Same line bucket + one path is a suffix of the other = the same place, spelled
+// with different amounts of root. This is what the bare basename used to buy, now
+// bought without also merging unrelated files that happen to share a name.
+// Quadratic, but over distinct locations (dozens), not findings.
+const locKeys = Object.keys(parent)
+for (let i = 0; i < locKeys.length; i++) {
+  const a = keyParts(locKeys[i])
+  for (let j = i + 1; j < locKeys.length; j++) {
+    const b = keyParts(locKeys[j])
+    if (a.line === b.line && isSamePath(a.path, b.path)) join(locKeys[i], locKeys[j])
+  }
+}
+
 const bySlug = {}
 for (const f of found) {
   const slug = String(f.root_cause || '').toLowerCase().trim()
@@ -391,12 +483,23 @@ if (overCap.length) {
 // spent before it does anything. One agent ruling on a file's claims pays that
 // once and reads the file once.
 
+// The batch label is the SHORTEST spelling anyone in the cluster used, not the
+// lead row's. Rows in one cluster can name the same file with different amounts
+// of root; picking the shortest makes two clusters in the same file land in one
+// batch instead of two, and keeps the "all in X" line in the prompt true.
+function clusterFile(c) {
+  let best = null
+  for (const f of c.rows) {
+    const p = normPath(f.file)
+    if (best === null || p.length < best.length) best = p
+  }
+  return best === null ? '?' : best
+}
+
 const batches = []
 const byFile = {}
 for (const c of toVerify) {
-  // normPath, not the basename - batching on the bare name puts claims from
-  // several unrelated files in one agent and then tells it they share a file.
-  const file = normPath(c.rows[0].file)
+  const file = clusterFile(c)
   if (!byFile[file]) byFile[file] = []
   byFile[file].push(c)
 }
@@ -443,7 +546,10 @@ avoid, so do not reintroduce it.
 ${claims}
 
 You have Bash. USE IT. Build the realistic state first; a probe on an empty
-fixture proves nothing. Put the actual command output in "proof".`, {
+fixture proves nothing. Build it in a scratch directory or on a copy - never on
+the working tree, a running service or an open session, and if that leaves the
+claim unprovable then unprovable is the answer. Put the actual command output
+in "proof".`, {
     label: `verify:${b.file}`,
     phase: 'Verify',
     model: VERIFIER_MODEL,
@@ -532,7 +638,14 @@ return {
   // second from an UNCHECKED bucket means it is never seen by anyone.
   serious_but_over_cap: expand(overCap, true),
   minor: expand(minor, false),
-  // What each pass says it actually read - the "no silent partial scan" half of
-  // the finder contract. Report it; it is how the reader judges the coverage.
+  // Schema-valid but empty of content, so never clustered or verified. Held here
+  // rather than deleted: the rule that recognises filler is a heuristic, and a
+  // heuristic that deletes eventually deletes something real in a repo this was
+  // never run against. If a dimension's whole output is in here, that dimension
+  // did not run - say UNSWEPT, not clean.
+  suspect,
+  // What each pass says it actually read, plus how many findings it produced.
+  // The count is what makes a dead dimension visible: `traced` is the finder's
+  // own account of its work and a failed one still writes a confident sentence.
   coverage,
 }

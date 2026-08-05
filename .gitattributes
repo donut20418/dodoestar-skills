@@ -1,0 +1,4 @@
+# Skills are read and executed as text by the agent harness, not by a compiler
+# that tolerates either ending. Force LF in the working tree on every platform so
+# a clone on Windows does not hand the harness a script full of CR bytes.
+* text=auto eol=lf

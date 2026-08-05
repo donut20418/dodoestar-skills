@@ -102,7 +102,7 @@ The workflow returns structured data and deliberately does NOT synthesise. You
 write the report, because you are the one who acts on it and because a
 synthesising agent that dies on a session limit takes the whole run with it.
 
-The return has five parts, and they are NOT interchangeable - report them as
+The return has seven parts, and they are NOT interchangeable - report them as
 what they are:
 
 | field | what it is | how to report it |
@@ -112,11 +112,18 @@ what they are:
 | `unresolved` | sent to a verifier, never ruled on | **unchecked.** Say so; do not let it read as refuted |
 | `serious_but_over_cap` | blocker/major the cap never reached | **unchecked.** Say so; these are not minor |
 | `minor` | minor/nit, never sent for verification | a flat list, labelled unverified |
-| `coverage` | what each pass says it read, and could not reach | one line per dimension - it is how the reader judges the sweep |
+| `suspect` | schema-valid but empty of content, quarantined before clustering | **unchecked and probably junk** - but if a dimension's whole output is here, that dimension DID NOT RUN |
+| `coverage` | per dimension: what it says it read, plus `findings` / `suspect` counts | one line each - it is how the reader judges the sweep |
 
-Three of those six are "nobody checked this": `unresolved`,
-`serious_but_over_cap`, and `minor`. Report them as three separate things.
+Four of those seven are "nobody checked this": `unresolved`,
+`serious_but_over_cap`, `minor`, and `suspect`. Report them as separate things.
 Folding a capped blocker in with the nits is worse than not running the review.
+
+**Read `coverage` counts before you write a word of the report.** A dimension
+with `findings: 0` was not swept, whatever its `traced` line claims - the
+workflow logs those, and calling them clean is the one mistake that makes the
+whole run worse than useless. Re-run that dimension alone, or say plainly in the
+report that it did not run.
 
 Be decisive about what is not worth fixing.
 
@@ -151,12 +158,16 @@ Measured on those 37 findings: grouping by file and line bucket collapsed them t
 as the primary key - independent agents do not converge on the same wording - so
 it is used only to merge groups.
 
-**The location is the path TAIL, not the bare filename.** Agents spell the root
-inconsistently ("build/x.py", "./build/x.py", an absolute path), which is what
-made the bare name tempting - but any repo that repeats a name across packages
-(27 `main.py`, 250 `__init__.py` in the codebase that surfaced this) then folds
-unrelated files into one cluster, and the verifier is told they share a file.
-Keeping the last few segments survives the prefix disagreement without that.
+**The location is the WHOLE path, joined on the suffix relation.** Agents spell
+the root inconsistently ("build/x.py", "./build/x.py", an absolute path), which
+is what made the bare filename tempting - but any repo that repeats a name across
+packages (27 `main.py`, 250 `__init__.py` in the codebase that surfaced this)
+then folds unrelated files into one cluster, and the verifier is told they share
+a file. A fixed number of tail segments is the same bug with a bigger number:
+three still collapses `apps/web/.../Button/index.tsx` and
+`apps/admin/.../Button/index.tsx`. Keep the full path and union the pairs where
+one is a suffix of the other - that absorbs the disagreement at any depth without
+assuming how the repo nests.
 
 And grouping is not discarding: two genuinely different bugs can share a line
 (measured). The whole group's claims go to one verifier, which rules on **each**.
@@ -178,6 +189,32 @@ same failure as sending only a cluster lead, one layer down.
 
 **Fail loudly on a bad dimension key.** An unrecognised key used to produce an
 empty sweep, and a run that finds nothing reads exactly like clean code.
+
+**And fail just as loudly on empty CONTENT.** A whole dimension once came back as
+`{"title":"test","file":"a.py","claim":"x","probe":"x"}` - every field the right
+type, nothing in any of them - and landed in `minor`, where it read as a swept
+dimension with one small issue. Same symptom as the bad key, so it needs the same
+noise: filler is quarantined into `suspect`, and `coverage` carries a per-dimension
+count so a dead pass cannot pass for a clean one.
+
+**Quarantine it, never delete it.** Recognising filler is a heuristic, and a
+heuristic with a delete on the end of it eventually deletes something real in a
+repo you cannot test against - "the path must contain a dot or a slash" would
+throw away a blocker found in `Makefile`, `Dockerfile` or `LICENSE`. Brevity is
+never disqualifying either: the finder persona explicitly invites a finder that
+cannot build a concrete trigger to say so on the finding. Only shapes that carry
+no information at all - an empty field, two single-token placeholders, all three
+body fields identical - get moved aside, and moved aside is all that happens.
+
+**Do not let the probe eat the user's work.** "Build the state the feature
+actually meets" is the rule that finds the real bugs, and it is one sentence away
+from telling an agent with Bash to construct that state on top of whatever the
+person is doing. It has cost an unsaved session already. The fixture goes in a
+scratch directory or on a copy; nothing that was not created by the agent gets
+reset, dropped, restarted or overwritten; and a claim that can only be settled by
+mutating one of those is reported unprovable, which is a correct answer and not a
+failure. This is not about any one kind of application - the same instruction
+reaches uncommitted work in the tree, a shared database, and a running container.
 
 ## The rule that finds the real bugs
 

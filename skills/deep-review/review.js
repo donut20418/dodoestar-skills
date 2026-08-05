@@ -429,6 +429,18 @@ for (const f of found) {
 // with different amounts of root. This is what the bare basename used to buy, now
 // bought without also merging unrelated files that happen to share a name.
 // Quadratic, but over distinct locations (dozens), not findings.
+//
+// KNOWN RESIDUAL, left in deliberately: a finding whose path is a BARE filename
+// is a suffix of every same-named file, so "x.py" lands in the same union as both
+// "build/x.py" and "other/x.py" and transitively bridges those two - but only when
+// all three share a line bucket. Simulated, so it is real. It is left alone
+// because the alternative (refusing to join a path with no directory in it) trades
+// a rare wrong merge for a rare missed dedup, and a missed dedup costs a whole
+// extra verifier while a wrong merge costs nothing but a confusing batch label:
+// every claim still carries its own file:line into the prompt, and the report
+// emits each row's own path, so no finding is lost or misattributed either way.
+// Merging stays the safe direction here for the same reason it is everywhere else
+// in this file - grouping is not discarding.
 const locKeys = Object.keys(parent)
 for (let i = 0; i < locKeys.length; i++) {
   const a = keyParts(locKeys[i])

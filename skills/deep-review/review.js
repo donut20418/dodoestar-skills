@@ -31,13 +31,14 @@ const VERIFIER_MODEL = 'opus'
 // not thinking harder. Raise this only with a measurement in hand.
 const VERIFIER_EFFORT = 'high'
 
-// A verifier handles a BATCH of claims from one file rather than one cluster.
+// A verifier handles a BATCH of claims from one or a handful of files rather
+// than one cluster.
 // MEASURED: two agents replying with a single word cost 63k tokens, so there is
 // a floor of roughly 31k per agent before any work happens at all. With 18
-// verifiers that floor alone is ~560k. Batching by file amortises it AND stops
+// verifiers that floor alone is ~560k. Batching amortises it AND stops
 // three agents reading the same file three times.
 //
-// Capped so a file with many findings does not become one overloaded agent.
+// Capped so one batch does not become one overloaded agent.
 const MAX_CLAIMS_PER_VERIFIER = 6
 
 const FINDER_PERSONA = `
@@ -72,9 +73,11 @@ honest gap.
 `
 
 const VERIFIER_PERSONA = `
-Your job is to KILL the finding. If it survives you honestly trying, it is
-probably real. You get one candidate. You are not reviewing the file, not looking
-for other bugs, and not fixing anything.
+Your job is to KILL the findings. If one survives you honestly trying, it is
+probably real. You get one or more candidates from the same file, and you rule on
+each one INDEPENDENTLY - a verdict on one never carries over to the next, and two
+of them may well be the same bug seen from different angles. You are not
+reviewing the file, not looking for other bugs, and not fixing anything.
 
 DEFAULT TO REFUTED. If you are still uncertain after tracing, the answer is not
 real. Every false positive that reaches a human costs a real investigation and
@@ -94,12 +97,16 @@ Work these in order and stop at the first that lands:
 The finding names a file and a line; that is where the claim points, not where
 the answer is. Read the callers.
 
-Some claims cannot be settled by running something - anything depending on what a
+Some claims cannot be settled by running ANYTHING you have - they turn on what a
 human sees rendered, on real hardware timing, on an environment you lack, or on
-mutating something you are not allowed to touch. Say so and answer real=false
-with the reason. A confident wrong verdict ends the investigation, but so does a
-probe that destroys the thing it was measuring: taking that exit is the correct
-move, not a failure.
+mutating something you are not allowed to touch. Those four are the whole list.
+Answer provable=false and give the reason; "real" is then ignored. A confident
+wrong verdict ends the investigation, but so does a probe that destroys the thing
+it was measuring: taking that exit is the correct move, not a failure.
+
+provable=false is NOT the exit from a hard claim. Being unsure after tracing is
+still REFUTED - that is provable=true with real=false. Answer provable=false only
+when you can NAME the specific thing you were unable to run or unable to touch.
 
 "Seems plausible" is not a verdict. "proof" must name evidence you actually
 looked at: the command you ran and its output, or the path:line that settles it.
@@ -107,7 +114,25 @@ looked at: the command you ran and its output, or the path:line that settles it.
 
 // ---------------------------------------------------------------------------
 
-const a = args || {}
+// The harness warns that a JSON-ENCODED string passed as `args` reaches the
+// script as one string, and it happened anyway on the first real run: every
+// field fell back to its default, six dimensions ran instead of the three asked
+// for, and the decisions digest never reached a single agent - double the cost,
+// and nothing told the caller. A string that parses to an object is unambiguous,
+// so recover it with a loud log; anything else dies here, before it spends.
+let a = args || {}
+if (typeof a === 'string') {
+  try { a = JSON.parse(a) } catch (e) {
+    throw new Error('deep-review: args arrived as a non-JSON string. ' +
+      'Pass args as a real JSON object in the Workflow call, not as an encoded string.')
+  }
+  if (!a || typeof a !== 'object' || Array.isArray(a)) {
+    throw new Error('deep-review: args parsed to ' + (Array.isArray(a) ? 'an array' : typeof a) +
+      ', not an object. Pass args as a real JSON object.')
+  }
+  log('args arrived as a JSON-encoded STRING and was recovered by parsing - ' +
+    'pass a real object next time')
+}
 const TARGET = a.target || 'the current working diff'
 const BRIEF = a.brief || ''
 const DECISIONS = a.decisions || '(none supplied - do not assume any)'
@@ -196,13 +221,19 @@ const VERDICT = {
             type: 'integer',
             description: 'the 1-based CLAIM number you are ruling on',
           },
+          // A THIRD state, because "nothing I can run settles this" is not a
+          // refutation. Routed as unchecked; `real` is ignored when it is false.
+          provable: {
+            type: 'boolean',
+            description: 'false ONLY when nothing you could run would settle it - a rendered UI, real hardware timing, an environment you lack, or state you must not mutate. Being unsure is NOT unprovable; that is real=false.',
+          },
           real: { type: 'boolean' },
           severity: { type: 'string', enum: ['blocker', 'major', 'minor', 'nit'] },
           reasoning: { type: 'string' },
           proof: { type: 'string' },
           fix: { type: 'string' },
         },
-        required: ['claim_index', 'real', 'severity', 'reasoning', 'proof', 'fix'],
+        required: ['claim_index', 'provable', 'real', 'severity', 'reasoning', 'proof', 'fix'],
         additionalProperties: false,
       },
     },
@@ -322,36 +353,55 @@ function degenerate(f) {
   return ''
 }
 
-const sweeps = swept.filter(Boolean)
+// Walk DIMENSIONS, not the surviving sweep results. An agent that ERRORS (retry
+// cap, terminal API failure) comes back from parallel() as null with its key
+// wrapper gone, and iterating the survivors used to erase that dimension from
+// coverage entirely - no row, no log, indistinguishable from never having asked.
+// Measured on the first real run: the ux finder burned 67k tokens failing its
+// schema five times and then simply did not exist in the output. A dimension
+// that died has to say so in coverage, same as one that returned filler.
+const byKey = {}
+for (const s of swept) { if (s) byKey[s.key] = s }
 const found = []
 const suspect = []
 const coverage = []
-for (const s of sweeps) {
-  if (!s.result) {
-    coverage.push({ dimension: s.key, traced: '(agent returned nothing)', findings: 0, suspect: 0 })
+const unswept = []
+for (const d of DIMENSIONS) {
+  if (!(d.key in byKey)) {
+    coverage.push({ dimension: d.key, traced: '(the finder agent DIED - dimension not swept)', findings: 0, suspect: 0 })
+    unswept.push(d.key)
+    continue
+  }
+  const result = byKey[d.key].result
+  if (!result) {
+    coverage.push({ dimension: d.key, traced: '(agent returned nothing)', findings: 0, suspect: 0 })
+    unswept.push(d.key)
     continue
   }
   let ok = 0
   let bad = 0
-  for (const f of s.result.findings || []) {
-    const row = { ...f, dimension: s.key }
+  for (const f of result.findings || []) {
+    const row = { ...f, dimension: d.key }
     const why = degenerate(row)
     if (why) { suspect.push({ ...row, suspect_reason: why }); bad++ } else { found.push(row); ok++ }
   }
   // The COUNTS are the point. `traced` is the finder's own word for what it read,
-  // and a finder that produced nothing usable still writes a confident one. Only
-  // a number separates a dimension that swept clean from one that never ran.
-  coverage.push({ dimension: s.key, traced: s.result.traced_clean, findings: ok, suspect: bad })
+  // and a finder that produced nothing usable still writes a confident one.
+  coverage.push({ dimension: d.key, traced: result.traced_clean, findings: ok, suspect: bad })
+  // Everything it produced was quarantined = it ran and said nothing usable.
+  // But findings 0 WITH suspect 0 is a clean sweep, not a dead one - the first
+  // real run shouted UNSWEPT at a dimension that had genuinely traced four
+  // things clean, which is crying wolf with the exact alarm that must stay
+  // credible. Only the all-filler case joins the dead list.
+  if (!ok && bad) unswept.push(d.key)
 }
 
 if (suspect.length) {
   log(`QUARANTINED ${suspect.length} finding(s) - schema-valid but empty of content: ` +
     suspect.map((s) => `${s.dimension}/${s.title}`).join(' | '))
 }
-const barren = coverage.filter((c) => !c.findings)
-if (barren.length) {
-  log(`PRODUCED NOTHING USABLE - treat as UNSWEPT, not clean: ` +
-    barren.map((c) => c.dimension).join(', '))
+if (unswept.length) {
+  log(`DID NOT SWEEP - treat as UNSWEPT, not clean: ${unswept.join(', ')}`)
 }
 
 // ---- Phase 2: dedup. Plain code, no agent, no tokens. ---------------------
@@ -490,10 +540,10 @@ if (overCap.length) {
 
 // ---- Phase 3: verify. Expensive, batched, and it RUNS things. ------------
 //
-// Batched BY FILE, because the cost floor is per AGENT and not per claim: two
-// agents answering with one word each cost 63k, so roughly 31k of every agent is
-// spent before it does anything. One agent ruling on a file's claims pays that
-// once and reads the file once.
+// Batched by CLAIM COUNT, same-file claims grouped first, because the cost floor
+// is per AGENT and not per claim: two agents answering with one word each cost
+// 63k, so roughly 31k of every agent is spent before it does anything. One agent
+// ruling on a batch pays that floor once and still reads each file once.
 
 // The batch label is the SHORTEST spelling anyone in the cluster used, not the
 // lead row's. Rows in one cluster can name the same file with different amounts
@@ -508,7 +558,20 @@ function clusterFile(c) {
   return best === null ? '?' : best
 }
 
-const batches = []
+// Chunk each file's clusters first (cluster-atomic; a lone cluster larger than
+// the cap stays whole, as before), THEN pack the chunks into bins by claim
+// count, largest first, under the same cap.
+//
+// Batching used to stop at the file boundary, which left the floor unamortised
+// in the most common spread there is: serious findings scattered one or two to
+// a file, every such file paying the ~31k floor for an agent that ruled on a
+// single claim. Measured by replaying this code over the shape of the published
+// run (18 clusters over 12 files): file-bound batching spends 12 verifiers
+// where packing spends 4; a wide scatter of singleton files is 12 against 3; a
+// concentrated spread is identical under both. A bin still reads each of its
+// files once - it just has two or three of them - and the floor measurement
+// above says the per-agent floor, not the reading, is the expensive half.
+const chunks = []
 const byFile = {}
 for (const c of toVerify) {
   const file = clusterFile(c)
@@ -520,23 +583,41 @@ for (const file of Object.keys(byFile)) {
   let claims = 0
   for (const c of byFile[file]) {
     if (claims && claims + c.rows.length > MAX_CLAIMS_PER_VERIFIER) {
-      batches.push({ file: file, clusters: pending })
+      chunks.push({ file: file, clusters: pending, claims: claims })
       pending = []
       claims = 0
     }
     pending.push(c)
     claims += c.rows.length
   }
-  if (pending.length) batches.push({ file: file, clusters: pending })
+  if (pending.length) chunks.push({ file: file, clusters: pending, claims: claims })
 }
 
-log(`${toVerify.length} locations -> ${batches.length} verifiers (batched by file)`)
+chunks.sort((x, y) => y.claims - x.claims)
+const batches = []
+for (const ch of chunks) {
+  let bin = null
+  for (const b of batches) {
+    if (b.claims + ch.claims <= MAX_CLAIMS_PER_VERIFIER) { bin = b; break }
+  }
+  if (!bin) { bin = { files: [], clusters: [], claims: 0 }; batches.push(bin) }
+  if (bin.files.indexOf(ch.file) === -1) bin.files.push(ch.file)
+  for (const c of ch.clusters) bin.clusters.push(c)
+  bin.claims += ch.claims
+}
+
+log(`${toVerify.length} locations -> ${chunks.length} file chunk(s) -> ` +
+  `${batches.length} verifiers (packed by claim count)`)
 
 phase('Verify')
 
 const verified = await parallel(batches.map((b) => () => {
   const rows = []
   for (const c of b.clusters) for (const f of c.rows) rows.push(f)
+  const label = b.files.join('+')
+  const where = b.files.length === 1
+    ? `all in ${b.files[0]}`
+    : `across ${b.files.length} files (${b.files.join(', ')}) - each claim names its own`
 
   const claims = rows.map((f, i) => `
 CLAIM ${i + 1}: ${f.title}
@@ -548,7 +629,7 @@ CLAIM ${i + 1}: ${f.title}
 
   return agent(`${VERIFIER_PERSONA}\n${CONTEXT}
 
-You have ${rows.length} claim(s), all in ${b.file}. Some may be one bug seen from
+You have ${rows.length} claim(s), ${where}. Some may be one bug seen from
 several angles; others may be unrelated bugs that happen to share a file. Decide
 per claim.
 
@@ -562,12 +643,12 @@ fixture proves nothing. Build it in a scratch directory or on a copy - never on
 the working tree, a running service or an open session, and if that leaves the
 claim unprovable then unprovable is the answer. Put the actual command output
 in "proof".`, {
-    label: `verify:${b.file}`,
+    label: `verify:${label}`,
     phase: 'Verify',
     model: VERIFIER_MODEL,
     effort: VERIFIER_EFFORT,
     schema: VERDICT,
-  }).then((v) => (v ? { file: b.file, claims: rows, verdict: v } : { file: b.file, claims: rows, verdict: null }))
+  }).then((v) => (v ? { file: label, claims: rows, verdict: v } : { file: label, claims: rows, verdict: null }))
 }))
 
 const results = verified.filter(Boolean)
@@ -577,13 +658,59 @@ const results = verified.filter(Boolean)
 // rulings array is the same class of loss as sending only a cluster lead.
 const confirmed = []
 const refuted = []
+const unprovable = []
 const unresolved = []
 for (const r of results) {
+  const rulings = (r.verdict && r.verdict.rulings) || []
+  const n = r.claims.length
+  const got = () => rulings.map((x) => x.claim_index).join(', ')
+
+  // Check the indices as a SET before attributing anything. A verifier that
+  // answers 0-based returns {0..n-1}: index 0 disappears at r.claims[-1] and
+  // every later ruling lands one claim EARLY - a confirmed defect filed under
+  // another claim's title, file and line. That is precisely the misattribution
+  // that switching from title matching to index matching was meant to end, and
+  // nothing downstream can see it, because every row it produces looks valid.
+  //
+  // ONLY out-of-range voids the batch. A SHORT array is not a shift: the rulings
+  // that are present are still correctly aimed, and the missing claims already
+  // fall through to unresolved below - voiding there would throw away good and
+  // expensive rulings in the most common failure mode there is. A DUPLICATE is
+  // not a shift either: it double-reports one claim and starves another, and the
+  // starved one lands in unresolved. Both are logged; neither voids.
+  const outOfRange = rulings
+    .map((x) => x.claim_index)
+    .filter((v) => !(typeof v === 'number' && v >= 1 && v <= n))
+  if (outOfRange.length) {
+    log(`BAD CLAIM INDICES from verify:${r.file} - expected 1..${n}, got [${got()}]. ` +
+      `Attributing NONE of this batch; all ${n} claim(s) go to unresolved.`)
+    for (const f of r.claims) {
+      unresolved.push({
+        title: f.title, file: f.file, line: f.line, severity: f.severity,
+        claim: f.claim, scenario: f.scenario,
+        why: `the verifier answered with claim_index values outside 1..${n} ` +
+          `([${got()}]), so no ruling in the batch could be safely attributed`,
+      })
+    }
+    continue
+  }
+
+  const seenIdx = {}
+  const dupes = []
+  for (const x of rulings) {
+    if (seenIdx[x.claim_index]) dupes.push(x.claim_index)
+    seenIdx[x.claim_index] = true
+  }
+  if (dupes.length) {
+    log(`DUPLICATE ruling(s) from verify:${r.file} on claim(s) ${dupes.join(', ')} ` +
+      `- each is kept as its own row; whatever went unruled is in unresolved.`)
+  }
+
   const ruled = {}
-  for (const ruling of (r.verdict && r.verdict.rulings) || []) {
-    const i = (ruling.claim_index || 0) - 1
+  for (const ruling of rulings) {
+    const i = ruling.claim_index - 1
     const src = r.claims[i]
-    if (!src) continue                       // an index nobody asked about
+    if (!src) continue                       // unreachable after the set check
     ruled[i] = true
     const row = {
       title: src.title, file: src.file, line: src.line,
@@ -591,7 +718,9 @@ for (const r of results) {
       severity: ruling.severity, reasoning: ruling.reasoning,
       proof: ruling.proof, fix: ruling.fix,
     }
-    ;(ruling.real ? confirmed : refuted).push(row)
+    // Unprovable first: it outranks `real`, which the persona says to ignore.
+    if (ruling.provable === false) unprovable.push(row)
+    else (ruling.real ? confirmed : refuted).push(row)
   }
   for (let i = 0; i < r.claims.length; i++) {
     if (ruled[i]) continue
@@ -607,7 +736,12 @@ if (unresolved.length) {
   log(`NOT RULED ON (${unresolved.length}): ` +
     unresolved.map((u) => u.title).join(' | '))
 }
+if (unprovable.length) {
+  log(`NO PROBE COULD SETTLE (${unprovable.length}) - unchecked, NOT refuted: ` +
+    unprovable.map((u) => u.title).join(' | '))
+}
 confirmed.sort((x, y) => RANK[x.severity] - RANK[y.severity])
+unprovable.sort((x, y) => RANK[x.severity] - RANK[y.severity])
 
 // Flatten a cluster list to one row PER FINDING, keeping each row's own file and
 // line rather than the lead's. `claims_in_group` carries the cluster size through
@@ -641,7 +775,14 @@ return {
   // Sent to a verifier and never ruled on. NOT the same as refuted, and not the
   // same as minor - these are unchecked, and the report has to say so.
   unresolved,
-  refuted: refuted.map((r) => ({ title: r.title, why: r.reasoning })),
+  // file and line ride along so a reader who doubts a refutation can go and
+  // look without re-deriving where the claim pointed. Costs nothing.
+  refuted: refuted.map((r) => ({ title: r.title, file: r.file, line: r.line, why: r.reasoning })),
+  // A verifier answered, and the answer was that nothing it could run settles
+  // this. NOT refuted - unchecked, same as unresolved. Emitted whole rather than
+  // trimmed to {title, why} the way refuted is: a reader who has to take this one
+  // further needs the file and line to go and look, which is the whole point.
+  unprovable,
   // EVERY row, not the cluster lead. These two buckets are the ones nobody
   // verified, so a lead-only list is the same silent loss this file warns about
   // when it sends a whole group to the verifier rather than a lead - one layer

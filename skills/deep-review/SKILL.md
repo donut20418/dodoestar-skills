@@ -1,6 +1,14 @@
 ---
 name: deep-review
-description: Multi-agent code review that fans out cheap finders over review dimensions, dedups their findings by root cause in plain code, then spends expensive verifiers on running an actual probe for each distinct cause. Use for a feature or module about to ship, a large change, or when a review has to be exhaustive rather than quick - and when the user asks for a review "with agents", "full review", "deep review", or names this skill. For a single diff, a plan, or a fast second opinion, use /scrutinize instead: it is one pass, no agents, and far cheaper.
+description: >-
+  Multi-agent code review that fans out cheap finders over review dimensions,
+  dedups their findings by root cause in plain code, then spends expensive
+  verifiers on running an actual probe for each distinct cause. Use for a
+  feature or module about to ship, a large change, or when a review has to be
+  exhaustive rather than quick - and when the user asks for a review "with
+  agents", "full review", "deep review", or names this skill. For a single
+  diff, a plan, or a fast second opinion, use /scrutinize instead: it is one
+  pass, no agents, and far cheaper.
 ---
 
 # Deep review
@@ -47,15 +55,16 @@ and the verifier is the one that runs it.
 **The dominant cost is the number of agents, not their tier.** Measured: two
 agents replying with a single word cost 63k tokens, so roughly **31k of every
 agent is spent before it does any work**. That is why verifiers are batched by
-file rather than run one-per-finding - the floor is paid once and the file is
-read once.
+claim count - same-file claims grouped first, then small files packed together
+under the same cap - rather than run one-per-finding or one-per-file: the floor
+is paid once per batch and each file is still read once.
 
 Simulated against the 37 real findings this shape was built from:
 
 ```
-37 findings -> 21 locations -> 18 serious -> 12 verifier agents   (was 29)
-total: 6 finders + 12 verifiers = 18 agents                       (was 38)
-floor alone: ~558k                                                (was ~1180k)
+37 findings -> 21 locations -> 18 serious -> 12 file chunks -> 4 verifiers
+total: 6 finders + 4 verifiers = 10 agents    (was 38; 18 when file-bound)
+floor alone: ~310k                            (was ~1180k; ~558k file-bound)
 ```
 
 ## The order of work
@@ -96,34 +105,43 @@ Workflow({
 `dimensions` is optional - omit it for all six. Drop the ones that do not apply
 (`ux` for a library, `realstate` for pure logic) rather than paying for them.
 
+`args` must be a real JSON object in the tool call, never a JSON-encoded
+string. Measured: a stringified args reached the script as one string, every
+field fell back to its default, six dimensions ran instead of the three asked
+for, and the run cost double. The script now recovers a parseable string with
+a loud log and refuses anything else - but pass the object.
+
 ### 3. Write the report yourself
 
 The workflow returns structured data and deliberately does NOT synthesise. You
 write the report, because you are the one who acts on it and because a
 synthesising agent that dies on a session limit takes the whole run with it.
 
-The return has seven parts, and they are NOT interchangeable - report them as
+The return has eight parts, and they are NOT interchangeable - report them as
 what they are:
 
 | field | what it is | how to report it |
 |---|---|---|
 | `confirmed` | a verifier tried to kill it and failed | ranked by harm, with file:line, scenario, proof, fix |
 | `refuted` | a verifier killed it | one line each, or drop - mention only if the refutation itself teaches something |
+| `unprovable` | a verifier answered, and the answer is that nothing it could run would settle this | **unchecked.** Say so, with the reason - these are the ones that need a human, or a rendered screen, or the hardware |
 | `unresolved` | sent to a verifier, never ruled on | **unchecked.** Say so; do not let it read as refuted |
 | `serious_but_over_cap` | blocker/major the cap never reached | **unchecked.** Say so; these are not minor |
 | `minor` | minor/nit, never sent for verification | a flat list, labelled unverified |
 | `suspect` | schema-valid but empty of content, quarantined before clustering | **unchecked and probably junk** - but if a dimension's whole output is here, that dimension DID NOT RUN |
 | `coverage` | per dimension: what it says it read, plus `findings` / `suspect` counts | one line each - it is how the reader judges the sweep |
 
-Four of those seven are "nobody checked this": `unresolved`,
+Five of those eight are "nobody checked this": `unprovable`, `unresolved`,
 `serious_but_over_cap`, `minor`, and `suspect`. Report them as separate things.
 Folding a capped blocker in with the nits is worse than not running the review.
 
-**Read `coverage` counts before you write a word of the report.** A dimension
-with `findings: 0` was not swept, whatever its `traced` line claims - the
-workflow logs those, and calling them clean is the one mistake that makes the
-whole run worse than useless. Re-run that dimension alone, or say plainly in the
-report that it did not run.
+**Read `coverage` counts before you write a word of the report.** `findings: 0`
+with `suspect: 0` and a real `traced` line is a clean sweep - report it as one.
+The dead cases are the rest, and the workflow logs each one: the finder agent
+died (its `traced` says so), it returned nothing, or everything it produced was
+quarantined (`findings: 0`, `suspect > 0`). Calling one of those clean is the
+one mistake that makes the whole run worse than useless. Re-run that dimension
+alone, or say plainly in the report that it did not run.
 
 Be decisive about what is not worth fixing.
 

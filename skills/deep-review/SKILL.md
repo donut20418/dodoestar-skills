@@ -83,6 +83,19 @@ Before invoking the workflow, work out three things yourself:
 That last one matters for cost. Handing every agent a long design document is
 a measured waste; they need the conclusions, not the reasoning.
 
+Then, with those three in hand, run the INTENT GATE before spending a single
+agent: state in one sentence what the thing under review is FOR, and ask whether
+a simpler, smaller, or different-layer design would achieve it - something that
+already exists and could be reused, a change at another layer, or nothing at
+all. Do this yourself, in the main loop: you are the strongest reasoner in the
+run and the only one holding the full context, and the finder/verifier machine
+below cannot do it - a design question has no file:line, no trigger, and no
+probe a verifier could run, so feeding it into the pipeline just mangles it into
+a thin unverified "minor". If the honest answer is "this should be reworked",
+say that to the user INSTEAD of invoking the workflow: a fan-out spent polishing
+the wrong design is the most expensive no-op there is. `/scrutinize` is the deep
+version of this same question.
+
 ### 2. Invoke the workflow
 
 Use the `review.js` sitting next to this file - resolve its path from the skill's

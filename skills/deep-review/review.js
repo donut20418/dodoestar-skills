@@ -54,9 +54,19 @@ Every finding needs a CONCRETE trigger: inputs or state, then the wrong output,
 crash or corruption. "This could race" is not a trigger; "if the timer fires
 while the writer holds a partial buffer, the file is truncated" is. If you cannot
 write one, say so on that finding - that is signal for the verifier, not a reason
-to drop it.
+to drop it. And say why it MATTERS: "consequence" is the harm to the person using
+the software if this ships - lost work, a lie on the screen, a stall - not the
+principle violated.
 
 Prefer the structural cause over the symptom.
+
+TRACE the path; do not stare at the lines. For each behaviour you suspect, walk
+it end to end - entry point, call sites, branches taken, state mutated, exit -
+including the unchanged code around it, because bugs live at the seams of a
+change. Anywhere the trace surprises you (an unexpected branch, dead code that
+is reachable, state you did not know existed) is signal: follow it before moving
+on. Tracing OUT of your slice to check an assumption is fine; reporting what
+belongs to another slice is not.
 
 LEARN THE PROJECT'S RULES FIRST. Read whatever guidance it ships - CLAUDE.md, a
 README, architecture notes, any check script under tools/ or scripts/. A
@@ -187,12 +197,16 @@ const FINDING = {
           },
           claim: { type: 'string' },
           scenario: { type: 'string' },
+          consequence: {
+            type: 'string',
+            description: 'why it matters: the harm to the person using the software if this ships, not the principle violated',
+          },
           probe: {
             type: 'string',
             description: 'the check that would PROVE this - a script, a state to build, a sequence to drive. You cannot run it; a verifier will.',
           },
         },
-        required: ['title', 'file', 'line', 'severity', 'root_cause', 'claim', 'scenario', 'probe'],
+        required: ['title', 'file', 'line', 'severity', 'root_cause', 'claim', 'scenario', 'consequence', 'probe'],
         additionalProperties: false,
       },
     },
@@ -625,6 +639,7 @@ CLAIM ${i + 1}: ${f.title}
   severity: ${f.severity}   (found by the "${f.dimension}" pass)
   detail:   ${f.claim}
   scenario: ${f.scenario}
+  matters:  ${f.consequence}
   probe the finder could not run: ${f.probe}`).join('\n')
 
   return agent(`${VERIFIER_PERSONA}\n${CONTEXT}
@@ -687,7 +702,7 @@ for (const r of results) {
     for (const f of r.claims) {
       unresolved.push({
         title: f.title, file: f.file, line: f.line, severity: f.severity,
-        claim: f.claim, scenario: f.scenario,
+        claim: f.claim, scenario: f.scenario, consequence: f.consequence,
         why: `the verifier answered with claim_index values outside 1..${n} ` +
           `([${got()}]), so no ruling in the batch could be safely attributed`,
       })
@@ -715,6 +730,7 @@ for (const r of results) {
     const row = {
       title: src.title, file: src.file, line: src.line,
       dimension: src.dimension, scenario: src.scenario,
+      consequence: src.consequence,
       severity: ruling.severity, reasoning: ruling.reasoning,
       proof: ruling.proof, fix: ruling.fix,
     }
@@ -727,7 +743,7 @@ for (const r of results) {
     const f = r.claims[i]
     unresolved.push({
       title: f.title, file: f.file, line: f.line, severity: f.severity,
-      claim: f.claim, scenario: f.scenario,
+      claim: f.claim, scenario: f.scenario, consequence: f.consequence,
       why: r.verdict ? 'the verifier returned no ruling for it' : 'the verifier failed',
     })
   }
@@ -752,7 +768,8 @@ function expand(cls, withCount) {
     for (const f of c.rows) {
       const row = {
         title: f.title, file: f.file, line: f.line,
-        severity: f.severity, claim: f.claim, dimension: f.dimension,
+        severity: f.severity, claim: f.claim, consequence: f.consequence,
+        dimension: f.dimension,
       }
       if (withCount) row.claims_in_group = c.count
       out.push(row)

@@ -1,0 +1,186 @@
+---
+name: deep-review
+description: Multi-agent code review that fans out cheap finders over review dimensions, dedups their findings by root cause in plain code, then spends expensive verifiers on running an actual probe for each distinct cause. Use for a feature or module about to ship, a large change, or when a review has to be exhaustive rather than quick - and when the user asks for a review "with agents", "full review", "deep review", or names this skill. For a single diff, a plan, or a fast second opinion, use /scrutinize instead: it is one pass, no agents, and far cheaper.
+---
+
+# Deep review
+
+A review that fans out. `/scrutinize` is one careful pass by you; this is many
+passes by many agents, and it costs real money - so the shape below exists to
+spend it where it buys something.
+
+## When NOT to use this
+
+- A single diff, a plan, a design doc, a quick sanity check -> `/scrutinize`.
+- Anything you could read in one sitting -> just read it.
+
+Reach for this when the surface is bigger than one pass: a feature about to
+ship, a module with many seams, a change that has already survived a review and
+you suspect it anyway.
+
+## Nothing to install
+
+Two files, nothing else. `SKILL.md` and `review.js`. It does not use
+`agentType`, so it depends on no agent definition in anybody's
+`.claude/agents/` and behaves the same wherever it is copied - the personas and
+the cost profile are both inside `review.js`, which is the only thing that runs.
+
+The cost profile is three constants at the top of that file:
+
+| role | model | effort | why |
+|---|---|---|---|
+| finder | `sonnet` | `low` | six of them, read-only, propose hypotheses |
+| verifier | `opus` | `high` | few of them, run real probes, rule on claims |
+
+**`high`, not `max`, and one tier rather than two.** There is no evidence `max`
+does this job better: the run this was built from used `high` for all
+twenty-nine verifiers, and they confirmed twenty-nine findings while refuting
+none - which points at a prompt that never tried to kill anything, not at
+insufficient reasoning. The persona in `review.js` is the fix for that. What
+settles a verdict is RUNNING the probe, which is tool use, not thinking harder.
+Raise it only with a measurement in hand.
+
+That split is the design. Finders are cheap because they are not asked to prove
+anything - every finding carries a `probe` field saying what would settle it,
+and the verifier is the one that runs it.
+
+**The dominant cost is the number of agents, not their tier.** Measured: two
+agents replying with a single word cost 63k tokens, so roughly **31k of every
+agent is spent before it does any work**. That is why verifiers are batched by
+file rather than run one-per-finding - the floor is paid once and the file is
+read once.
+
+Simulated against the 37 real findings this shape was built from:
+
+```
+37 findings -> 21 locations -> 18 serious -> 12 verifier agents   (was 29)
+total: 6 finders + 12 verifiers = 18 agents                       (was 38)
+floor alone: ~558k                                                (was ~1180k)
+```
+
+## The order of work
+
+Run it in this order. The order is the saving.
+
+### 1. Gather the inputs first - in the main loop, not in an agent
+
+Before invoking the workflow, work out three things yourself:
+
+- **target** - what is under review, as a path list or a description.
+- **brief** - one paragraph: what it is meant to do.
+- **decisions** - a SHORT digest of what is deliberate, so agents do not report
+  design as defect. Ten lines, not a document.
+
+That last one matters for cost. Handing every agent a long design document is
+a measured waste; they need the conclusions, not the reasoning.
+
+### 2. Invoke the workflow
+
+Use the `review.js` sitting next to this file - resolve its path from the skill's
+own directory rather than hard-coding a home folder, so a copy of this skill
+works wherever it was installed.
+
+```
+Workflow({
+  scriptPath: "<skill dir>/review.js",
+  args: {
+    target: "...",
+    brief: "...",
+    decisions: "...",
+    dimensions: ["integrity", "seams", "realstate", "lifecycle", "ux", "tests"],
+    maxVerify: 18
+  }
+})
+```
+
+`dimensions` is optional - omit it for all six. Drop the ones that do not apply
+(`ux` for a library, `realstate` for pure logic) rather than paying for them.
+
+### 3. Write the report yourself
+
+The workflow returns structured data and deliberately does NOT synthesise. You
+write the report, because you are the one who acts on it and because a
+synthesising agent that dies on a session limit takes the whole run with it.
+
+The return has five parts, and they are NOT interchangeable - report them as
+what they are:
+
+| field | what it is | how to report it |
+|---|---|---|
+| `confirmed` | a verifier tried to kill it and failed | ranked by harm, with file:line, scenario, proof, fix |
+| `refuted` | a verifier killed it | one line each, or drop - mention only if the refutation itself teaches something |
+| `unresolved` | sent to a verifier, never ruled on | **unchecked.** Say so; do not let it read as refuted |
+| `serious_but_over_cap` | blocker/major the cap never reached | **unchecked.** Say so; these are not minor |
+| `minor` | minor/nit, never sent for verification | a flat list, labelled unverified |
+| `coverage` | what each pass says it read, and could not reach | one line per dimension - it is how the reader judges the sweep |
+
+Three of those six are "nobody checked this": `unresolved`,
+`serious_but_over_cap`, and `minor`. Report them as three separate things.
+Folding a capped blocker in with the nits is worse than not running the review.
+
+Be decisive about what is not worth fixing.
+
+## Why it is shaped this way
+
+Every rule below is a correction to something that actually went wrong.
+
+**Slice by DIMENSION, not by file.** File-sliced reviewers found nothing; the
+reviewer given "the seams" found a crash, and the one given "real data" found a
+720 MB defect. Bugs live between files.
+
+**Set the model per role.** The first version passed neither `model` nor
+`agentType`, so all thirty-eight agents inherited the session model - six cheap
+finders became six expensive ones, and that alone cost more than everything
+else. The constants at the top of `review.js` are the cost profile; changing
+them is the only supported way to change what a run costs.
+
+**Count agents before tuning tiers.** Measured: two agents replying with a
+single word cost 63k tokens, so roughly 31k of every agent is spent before it
+does any work. Halving the agent count beats any effort tweak, which is why
+verifiers are batched and why an effort tier was NOT the answer to the cost
+problem - it looked like one for about ten minutes.
+
+**Finders form hypotheses; verifiers prove them.** Every finding carries a
+`probe` field - the check that would settle it - and the verifier is what runs
+it. Asking a finder to find something only a probe can see is asking it to fail.
+
+**Dedup by LOCATION, in plain code, and never discard.** One bug arrived three
+times under three titles and was proved three times by three expensive agents.
+Measured on those 37 findings: grouping by file and line bucket collapsed them to
+27 and caught every duplicate that mattered. The `root_cause` slug does NOT work
+as the primary key - independent agents do not converge on the same wording - so
+it is used only to merge groups.
+
+And grouping is not discarding: two genuinely different bugs can share a line
+(measured). The whole group's claims go to one verifier, which rules on **each**.
+Sending only a "lead" silently loses the rest.
+
+**Verify blockers before majors.** The cap must never drop a blocker to make room
+for a major.
+
+**Match rulings by INDEX, never by an echoed title.** A verifier that paraphrases
+a title breaks a title lookup, and the fallback then files the ruling under
+another claim's file and line - a confirmed defect reported at the wrong place.
+And count the rulings: a short array used to lose findings silently, which is the
+same failure as sending only a cluster lead, one layer down.
+
+**Cap the verifiers and report the overflow as unchecked.** A silent cap reads as
+"we checked everything"; a capped blocker filed under "minor" is worse.
+
+**Fail loudly on a bad dimension key.** An unrecognised key used to produce an
+empty sweep, and a run that finds nothing reads exactly like clean code.
+
+## The rule that finds the real bugs
+
+**Judge the code in the state it really runs in.**
+
+The worst defect this shape ever found - a 720 MB-per-fifty-steps regression -
+was invisible to five careful reading passes AND to a purpose-built benchmark,
+because the benchmark constructed a project with no mesh loaded and the bug was
+that the mesh was being copied. The test written to guard against exactly that
+class of bug had the same hole.
+
+So: before any measurement or any claim about cost, build the state the feature
+actually meets. A loaded model. Several materials. Many tiles. A deep stack.
+Then measure. This is written into the context every agent receives, and it is
+the single line most likely to earn the run back.

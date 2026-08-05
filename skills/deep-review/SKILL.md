@@ -151,9 +151,18 @@ Measured on those 37 findings: grouping by file and line bucket collapsed them t
 as the primary key - independent agents do not converge on the same wording - so
 it is used only to merge groups.
 
+**The location is the path TAIL, not the bare filename.** Agents spell the root
+inconsistently ("build/x.py", "./build/x.py", an absolute path), which is what
+made the bare name tempting - but any repo that repeats a name across packages
+(27 `main.py`, 250 `__init__.py` in the codebase that surfaced this) then folds
+unrelated files into one cluster, and the verifier is told they share a file.
+Keeping the last few segments survives the prefix disagreement without that.
+
 And grouping is not discarding: two genuinely different bugs can share a line
 (measured). The whole group's claims go to one verifier, which rules on **each**.
-Sending only a "lead" silently loses the rest.
+Sending only a "lead" silently loses the rest - and that applies to the OUTPUT
+too. `minor` and `serious_but_over_cap` list every row, not the cluster lead,
+because those are the buckets no agent ever looked at.
 
 **Verify blockers before majors.** The cap must never drop a blocker to make room
 for a major.

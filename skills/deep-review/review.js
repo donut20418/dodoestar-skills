@@ -3,7 +3,7 @@ export const meta = {
   description: 'Multi-agent code review: cheap finders fan out, plain code dedups by location, expensive verifiers prove',
   phases: [
     { title: 'Find', detail: 'finders sweep the dimensions (sonnet, low effort)' },
-    { title: 'Verify', detail: 'verifiers RUN a probe per deduped location (opus, max effort)' },
+    { title: 'Verify', detail: 'verifiers RUN a probe per deduped location (opus, high effort)' },
   ],
 }
 
@@ -302,10 +302,34 @@ for (const s of sweeps) {
 // - measured, at undo_commands.py:114 - so the whole group's claims go to the
 // verifier and it rules on each. Sending only a "lead" silently loses the rest.
 
+// The file half of the key is the last few PATH SEGMENTS, not the bare basename.
+//
+// Basename alone was the original choice for a good reason - independent agents
+// report the same file differently ("build/x.py", "./build/x.py", an absolute
+// path), and the bare name is the one form they all agree on. But it
+// over-normalises: any repo where a name repeats across packages - 27 main.py,
+// 29 config.py, 250 __init__.py in the codebase this was fixed against - collapses
+// unrelated files into one cluster. Downstream that hands a verifier claims from
+// several files while telling it they are "all in config.py", and the batching
+// below reads the wrong file.
+//
+// Keeping the tail segments survives the prefix disagreement that motivated the
+// basename (a suffix is stable however the agent spelled the root) while still
+// separating qc_tool/core/config.py from subdiv_tool/core/config.py.
+const PATH_SEGMENTS = 3
+
+function normPath(p) {
+  const parts = String(p || '?')
+    .replace(/\\/g, '/')
+    .toLowerCase()
+    .split('/')
+    .filter((s) => s && s !== '.')
+  return parts.slice(-PATH_SEGMENTS).join('/')
+}
+
 function locKey(f) {
-  const file = String(f.file || '?').replace(/\\/g, '/').split('/').pop()
   const line = typeof f.line === 'number' ? Math.floor(f.line / 20) : 'x'
-  return file + '#' + line
+  return normPath(f.file) + '#' + line
 }
 
 const parent = {}
@@ -370,7 +394,9 @@ if (overCap.length) {
 const batches = []
 const byFile = {}
 for (const c of toVerify) {
-  const file = String(c.rows[0].file || '?').replace(/\\/g, '/').split('/').pop()
+  // normPath, not the basename - batching on the bare name puts claims from
+  // several unrelated files in one agent and then tells it they share a file.
+  const file = normPath(c.rows[0].file)
   if (!byFile[file]) byFile[file] = []
   byFile[file].push(c)
 }
@@ -465,6 +491,25 @@ if (unresolved.length) {
 }
 confirmed.sort((x, y) => RANK[x.severity] - RANK[y.severity])
 
+// Flatten a cluster list to one row PER FINDING, keeping each row's own file and
+// line rather than the lead's. `claims_in_group` carries the cluster size through
+// so the report can still say which rows arrived together.
+function expand(cls, withCount) {
+  const out = []
+  for (const c of cls) {
+    for (const f of c.rows) {
+      const row = {
+        title: f.title, file: f.file, line: f.line,
+        severity: f.severity, claim: f.claim, dimension: f.dimension,
+      }
+      if (withCount) row.claims_in_group = c.count
+      out.push(row)
+    }
+  }
+  out.sort((x, y) => RANK[x.severity] - RANK[y.severity])
+  return out
+}
+
 // Synthesis happens in the MAIN LOOP, not in an agent: it is the cheapest place
 // for it, the main loop is what acts on the report, and a synthesising agent that
 // dies on a session limit takes the whole run's value with it - which is exactly
@@ -479,14 +524,14 @@ return {
   // same as minor - these are unchecked, and the report has to say so.
   unresolved,
   refuted: refuted.map((r) => ({ title: r.title, why: r.reasoning })),
-  serious_but_over_cap: overCap.map((c) => ({
-    title: c.rows[0].title, file: c.rows[0].file, line: c.rows[0].line,
-    severity: c.worst, claims_in_group: c.count,
-  })),
-  minor: minor.map((c) => ({
-    title: c.rows[0].title, file: c.rows[0].file, line: c.rows[0].line,
-    severity: c.worst, claim: c.rows[0].claim,
-  })),
+  // EVERY row, not the cluster lead. These two buckets are the ones nobody
+  // verified, so a lead-only list is the same silent loss this file warns about
+  // when it sends a whole group to the verifier rather than a lead - one layer
+  // further down, and worse here because no agent ever looked at these at all.
+  // A cluster can hold two genuinely different bugs (measured), and dropping the
+  // second from an UNCHECKED bucket means it is never seen by anyone.
+  serious_but_over_cap: expand(overCap, true),
+  minor: expand(minor, false),
   // What each pass says it actually read - the "no silent partial scan" half of
   // the finder contract. Report it; it is how the reader judges the coverage.
   coverage,

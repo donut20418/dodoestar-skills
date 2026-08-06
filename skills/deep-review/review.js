@@ -176,6 +176,15 @@ stash, truncate, drop, restart, uninstall or overwrite anything you did not
 create yourself. If the only way to settle a claim is to mutate one of those,
 DO NOT - leave it alone and report the claim as one you could not prove.
 
+ONE COPY OF THE REPOSITORY, THE ONE UNDER REVIEW. A checkout can contain whole
+parallel copies of itself - `.claude/worktrees/<name>/`, a vendored tree, a
+build output - and another session may already have FIXED there the very thing
+you are looking for. Measured: a finder read thirteen files out of a worktree
+and nothing in its report said so, so every claim cited a path that looked real
+and described different code. If a path contains `worktrees`, `node_modules`,
+`site-packages`, `venv`, `dist` or `build`, it is not the code under review;
+read the same path without it.
+
 Cite file:line for everything. Never edit a file.
 `
 
@@ -367,6 +376,20 @@ function degenerate(f) {
   return ''
 }
 
+// `traced_clean` is the finder's account of what it read, and the schema only
+// asks for a string. Observed on a live sweep: a finder made one tool call,
+// found nothing, and filed its ENTIRE account as "[]" - which scores
+// findings 0 / suspect 0, the clean-sweep case, and reads in the report as a
+// dimension that was checked. Same standard as `degenerate` below: a
+// non-answer, not brevity. A finder honestly reporting "read a.py only" is
+// telling the truth in five words and must not be punished for it.
+function noAccount(traced) {
+  const t = String(traced == null ? '' : traced).trim()
+  if (!t) return true
+  if (!t.replace(/[\s[\]{}(),.:;"'-]/g, '')) return true      // punctuation only
+  return t.length <= 3 && t.indexOf(' ') === -1               // one bare token
+}
+
 // Walk DIMENSIONS, not the surviving sweep results. An agent that ERRORS (retry
 // cap, terminal API failure) comes back from parallel() as null with its key
 // wrapper gone, and iterating the survivors used to erase that dimension from
@@ -401,13 +424,25 @@ for (const d of DIMENSIONS) {
   }
   // The COUNTS are the point. `traced` is the finder's own word for what it read,
   // and a finder that produced nothing usable still writes a confident one.
-  coverage.push({ dimension: d.key, traced: result.traced_clean, findings: ok, suspect: bad })
+  const mute = noAccount(result.traced_clean)
+  coverage.push({
+    dimension: d.key,
+    traced: mute
+      ? `(NO ACCOUNT GIVEN - the finder wrote ${JSON.stringify(String(result.traced_clean || ''))} and nothing else)`
+      : result.traced_clean,
+    findings: ok,
+    suspect: bad,
+  })
   // Everything it produced was quarantined = it ran and said nothing usable.
   // But findings 0 WITH suspect 0 is a clean sweep, not a dead one - the first
   // real run shouted UNSWEPT at a dimension that had genuinely traced four
   // things clean, which is crying wolf with the exact alarm that must stay
   // credible. Only the all-filler case joins the dead list.
-  if (!ok && bad) unswept.push(d.key)
+  //
+  // ...and the case with nothing to show and nothing to say. Zero findings is a
+  // clean sweep only when the finder can tell you what it read; zero findings
+  // and no account is a dimension nobody has any evidence was looked at.
+  if ((!ok && bad) || (!ok && mute)) unswept.push(d.key)
 }
 
 if (suspect.length) {

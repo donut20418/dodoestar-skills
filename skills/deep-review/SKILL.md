@@ -149,7 +149,11 @@ Five of those eight are "nobody checked this": `unprovable`, `unresolved`,
 Folding a capped blocker in with the nits is worse than not running the review.
 
 **Read `coverage` counts before you write a word of the report.** `findings: 0`
-with `suspect: 0` and a real `traced` line is a clean sweep - report it as one.
+with `suspect: 0` **and a real `traced` line** is a clean sweep - report it as
+one. A `traced` reading `(NO ACCOUNT GIVEN ...)` is not: measured, a finder made
+one tool call, found nothing, and filed its entire account as `[]`, which scores
+as clean and reads in a report as a dimension that was checked. Zero findings is
+a clean sweep only when the finder can say what it read.
 The dead cases are the rest, and the workflow logs each one: the finder agent
 died (its `traced` says so), it returned nothing, or everything it produced was
 quarantined (`findings: 0`, `suspect > 0`). Calling one of those clean is the
@@ -220,6 +224,14 @@ same failure as sending only a cluster lead, one layer down.
 
 **Fail loudly on a bad dimension key.** An unrecognised key used to produce an
 empty sweep, and a run that finds nothing reads exactly like clean code.
+
+**One copy of the repository.** A checkout can hold whole parallel copies of
+itself - `.claude/worktrees/<name>/`, a vendored tree, a build output - and
+another session may already have FIXED there the thing being looked for.
+Measured: a finder read thirteen files out of a worktree and nothing in its
+report said so, so every claim cited a path that looked real and described
+different code. The finder context now names those directories and says to read
+the same path without them.
 
 **And fail just as loudly on empty CONTENT.** A whole dimension once came back as
 `{"title":"test","file":"a.py","claim":"x","probe":"x"}` - every field the right

@@ -177,13 +177,13 @@ create yourself. If the only way to settle a claim is to mutate one of those,
 DO NOT - leave it alone and report the claim as one you could not prove.
 
 ONE COPY OF THE REPOSITORY, THE ONE UNDER REVIEW. A checkout can contain whole
-parallel copies of itself - `.claude/worktrees/<name>/`, a vendored tree, a
-build output - and another session may already have FIXED there the very thing
-you are looking for. Measured: a finder read thirteen files out of a worktree
-and nothing in its report said so, so every claim cited a path that looked real
-and described different code. If a path contains `worktrees`, `node_modules`,
-`site-packages`, `venv`, `dist` or `build`, it is not the code under review;
-read the same path without it.
+parallel copies of itself - a worktree under .claude, a vendored tree, a build
+output - and another session may already have FIXED there the very thing you
+are looking for. Measured: a finder read thirteen files out of a worktree and
+nothing in its report said so, so every claim cited a path that looked real and
+described different code. If a path contains worktrees, node_modules,
+site-packages, venv, dist or build, it is not the code under review; read the
+same path without it.
 
 Cite file:line for everything. Never edit a file.
 `

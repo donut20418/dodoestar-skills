@@ -26,6 +26,7 @@ Then `/deep-review` is available in any session.
 | skill | what it does |
 |---|---|
 | [`deep-review`](skills/deep-review) | multi-agent code review: cheap finders fan out, plain code dedups, expensive verifiers run a real probe and rule |
+| [`reply-style`](skills/reply-style) | one owner's answering style, as rules any agent can read: short answers, and a done / left / next wrap-up |
 
 ---
 
